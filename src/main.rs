@@ -1,6 +1,9 @@
 #![allow(clippy::option_if_let_else, clippy::no_effect_underscore_binding)]
 
-use rand::distributions::{Alphanumeric, DistString};
+use rand::{
+    distributions::{Alphanumeric, DistString},
+    random,
+};
 use rocket::{
     fs::{relative, FileServer},
     get,
@@ -8,60 +11,45 @@ use rocket::{
     launch,
     request::{FromRequest, Outcome, Request},
     response::Redirect,
-    routes, State,
+    routes, uri, State,
 };
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
 };
 
-enum Player {
-    InLobby { name: String, ready: bool },
-    InGame { name: String },
+mod game;
+
+use game::{errors::PlayerJoinError, Game};
+
+struct Player {
+    id: usize,
+    connected: bool,
+    pub name: String,
 }
 
-impl Player {
-    fn name(&self) -> &str {
-        match self {
-            Self::InLobby { name, .. } | Self::InGame { name } => name,
-        }
+impl game::Player for Player {
+    fn id(&self) -> usize {
+        self.id
+    }
+
+    fn connected(&self) -> bool {
+        self.connected
+    }
+
+    fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
     }
 }
 
-enum Game {
-    Lobby {
-        name: String,
-        players: HashMap<String, Player>,
-    },
-    Ingame {
-        name: String,
-        player: Vec<String>,
-    },
-}
-
-impl Game {
-    pub fn new(name: String) -> Self {
-        Self::Lobby {
-            name,
-            players: HashMap::new(),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Lobby { name, .. } | Self::Ingame { name, .. } => name,
-        }
-    }
-}
-
-struct ProtectedGame(Arc<Mutex<Game>>);
+struct ProtectedGame(Arc<Mutex<Game<Player>>>);
 
 impl ProtectedGame {
     pub fn new(name: String) -> Self {
         Self(Arc::new(Mutex::new(Game::new(name))))
     }
 
-    pub fn get(&self) -> MutexGuard<Game> {
+    pub fn get(&self) -> MutexGuard<Game<Player>> {
         self.0.lock().unwrap()
     }
 }
@@ -110,13 +98,19 @@ impl Games {
 
 #[get("/test")]
 #[must_use]
-fn test(game: ProtectedGame) -> String {
-    game.get().name().to_owned()
+fn test(game: ProtectedGame, jar: &CookieJar<'_>) -> String {
+    let game = game.get();
+    game.name().to_owned()
+        + " "
+        + &game
+            .get_player(jar.get_private("userid").unwrap().value().parse().unwrap())
+            .unwrap()
+            .name
 }
 
-#[get("/create?<name>")]
+#[get("/create?<name>&<username>")]
 #[must_use]
-fn create(name: Option<String>, games: &State<Games>, jar: &CookieJar<'_>) -> String {
+fn create(name: Option<String>, username: String, games: &State<Games>) -> Redirect {
     let mut name = name
         .unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::thread_rng(), 8))
         .to_uppercase();
@@ -131,13 +125,39 @@ fn create(name: Option<String>, games: &State<Games>, jar: &CookieJar<'_>) -> St
         games.insert(name.clone(), ProtectedGame::new(name.clone()));
     }
 
-    jar.add_private(("lobby", name.clone()));
-    name
+    Redirect::to(uri!(join(name, username)))
+}
+
+#[get("/join?<lobby>&<name>")]
+#[must_use]
+fn join(lobby: String, name: String, games: &State<Games>, jar: &CookieJar<'_>) -> Redirect {
+    if !games.games.lock().unwrap().contains_key(&lobby) {
+        return Redirect::to("/lobby.html");
+    }
+
+    let id = random();
+    let player = Player {
+        id,
+        connected: true,
+        name,
+    };
+
+    let result = games.games.lock().unwrap()[&lobby].get().add_player(player);
+    match result {
+        Ok(()) => (),
+        Err(PlayerJoinError::GameFull) => return Redirect::to("/lobby1.html"),
+        Err(PlayerJoinError::GameAlreadyStarted) => return Redirect::to("/lobby2.html"),
+    };
+
+    jar.add_private(("lobby", lobby));
+    jar.add_private(("userid", id.to_string()));
+
+    Redirect::to(uri!("/ingame.html"))
 }
 
 #[get("/")]
 fn index() -> Redirect {
-    Redirect::to("/index.html")
+    Redirect::to("/gameMenu.html")
 }
 
 #[launch]
@@ -145,5 +165,5 @@ fn rocket() -> _ {
     rocket::build()
         .mount("/", FileServer::from(relative!("static")))
         .manage(Games::new())
-        .mount("/", routes![index, create, test])
+        .mount("/", routes![index, create, join, test])
 }
