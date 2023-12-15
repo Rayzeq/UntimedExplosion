@@ -1,3 +1,4 @@
 [submodule "static"]
 	path = static
-	url = https://github.com/Nissyaniss/TimeBomb.git
+	url = git@github.com:Nissyaniss/TimeBomb.git
+	branch = main
