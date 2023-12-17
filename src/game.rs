@@ -6,18 +6,18 @@ use rocket::serde::Serialize;
 use std::{collections::HashMap, hash::Hash};
 
 macro_rules! repeated_vec {
-    ($($quantity:literal $value:expr),*) => {{
-        let mut v = Vec::with_capacity(repeated_vec!(@sum $($quantity)*));
+    ($($quantity:expr => $value:expr),*) => {{
+        let mut v = Vec::with_capacity(repeated_vec!(@sum $($quantity),*));
         $(
             v.extend(std::iter::repeat($value).take($quantity));
         )*
         v
     }};
-    (@sum $quantity:literal) => {
+    (@sum $quantity:expr) => {
         $quantity
     };
-    (@sum $quantity:literal $($quantities:literal)*) => {
-        $quantity + repeated_vec!(@sum $($quantities)*)
+    (@sum $quantity:expr, $($quantities:expr),*) => {
+        $quantity + repeated_vec!(@sum $($quantities),*)
     };
 }
 
@@ -63,8 +63,8 @@ enum GameState<PLAYER: Player> {
     Lobby,
     Ingame {
         wire_cutters: PLAYER::ID,
-        defusing_remaining: u8,
-        cutted_count: u8,
+        defusing_remaining: usize,
+        cutted_count: usize,
     },
 }
 
@@ -130,6 +130,14 @@ impl<PLAYER: Player> Game<PLAYER> {
         matches!(self.state, GameState::Ingame { .. })
     }
 
+    const fn cable_counts(player_count: usize) -> (usize, usize, usize) {
+        let defusing = player_count;
+        let bomb = 1;
+        let safe = player_count * 5 - defusing - bomb;
+
+        (safe, defusing, bomb)
+    }
+
     fn distribute_cables(&mut self, mut cables: Vec<Cable>) {
         cables.shuffle(&mut thread_rng());
 
@@ -148,9 +156,9 @@ impl<PLAYER: Player> Game<PLAYER> {
         }
 
         let mut teams = match self.players.len() {
-            4..=5 => repeated_vec![3 Team::Sherlock, 2 Team::Moriarty],
-            6 => repeated_vec![4 Team::Sherlock, 2 Team::Moriarty],
-            7..=8 => repeated_vec![5 Team::Sherlock, 3 Team::Moriarty],
+            4..=5 => repeated_vec![3 => Team::Sherlock, 2 => Team::Moriarty],
+            6 => repeated_vec![4 => Team::Sherlock, 2 => Team::Moriarty],
+            7..=8 => repeated_vec![5 => Team::Sherlock, 3 => Team::Moriarty],
             _ => unreachable!(),
         };
         teams.shuffle(&mut thread_rng());
@@ -159,29 +167,8 @@ impl<PLAYER: Player> Game<PLAYER> {
             player.set_team(teams.pop().unwrap());
         }
 
-        let (cables, defusing_cables) = match self.players.len() {
-            4 => (
-                repeated_vec![15 Cable::Safe, 4 Cable::Defusing, 1 Cable::Bomb],
-                4,
-            ),
-            5 => (
-                repeated_vec![19 Cable::Safe, 5 Cable::Defusing, 1 Cable::Bomb],
-                5,
-            ),
-            6 => (
-                repeated_vec![23 Cable::Safe, 6 Cable::Defusing, 1 Cable::Bomb],
-                6,
-            ),
-            7 => (
-                repeated_vec![27 Cable::Safe, 7 Cable::Defusing, 1 Cable::Bomb],
-                7,
-            ),
-            8 => (
-                repeated_vec![31 Cable::Safe, 8 Cable::Defusing, 1 Cable::Bomb],
-                8,
-            ),
-            _ => unreachable!(),
-        };
+        let (safe_cables, defusing_cables, bomb) = Self::cable_counts(self.players.len());
+        let cables = repeated_vec![safe_cables => Cable::Safe, defusing_cables => Cable::Defusing, bomb => Cable::Bomb];
 
         self.distribute_cables(cables);
 
@@ -226,7 +213,7 @@ impl<PLAYER: Player> Game<PLAYER> {
                 return Ok((cable, CutOutcome::Win(Team::Sherlock)));
             }
 
-            if *cutted_count == self.players.len() as u8 {
+            if *cutted_count == self.players.len() {
                 Ok((cable, CutOutcome::RoundEnd))
             } else {
                 Ok((cable, CutOutcome::Nothing))
