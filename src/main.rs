@@ -13,16 +13,17 @@ use rocket::{
     launch,
     request::{FromRequest, Outcome, Request},
     response::{
+        status::BadRequest,
         stream::{Event, EventStream},
         Redirect,
     },
     routes,
-    serde::{json::Json, Serialize},
+    serde::Serialize,
     tokio::{
         select,
         sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     },
-    uri, Responder, Shutdown, State,
+    uri, Shutdown, State,
 };
 use std::{
     collections::HashMap,
@@ -225,32 +226,33 @@ impl Games {
     }
 }
 
-#[get("/create?<name>&<username>")]
+#[get("/create?<name>&<id>")]
 #[must_use]
-fn create(name: Option<String>, username: String, games: &State<Games>) -> Redirect {
-    let mut name = name.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::thread_rng(), 6));
+fn create(name: String, id: Option<String>, games: &State<Games>) -> Redirect {
+    let mut id = id.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::thread_rng(), 6));
 
     {
         let mut games = games.games.lock().unwrap();
 
-        while games.contains_key(&name) {
-            name = Alphanumeric.sample_string(&mut rand::thread_rng(), 6);
+        while games.contains_key(&id) {
+            id = Alphanumeric.sample_string(&mut rand::thread_rng(), 6);
         }
-        name = name.to_uppercase();
+        id = id.to_uppercase();
 
-        games.insert(name.clone(), ProtectedGame::new(name.clone()));
+        games.insert(id.clone(), ProtectedGame::new(id.clone()));
     }
 
-    Redirect::to(uri!(join(name, username)))
+    Redirect::to(uri!(join(id, name)))
 }
 
+// TODO: if a player join but never call /events, he will be in the game even though he is not really here
 #[get("/join?<lobby>&<name>")]
 #[must_use]
-fn join(lobby: String, name: String, games: &State<Games>, jar: &CookieJar<'_>) -> Redirect {
+fn join(lobby: &str, name: String, games: &State<Games>, jar: &CookieJar<'_>) -> Redirect {
     let lobby = lobby.to_uppercase();
 
     if !games.games.lock().unwrap().contains_key(&lobby) {
-        return Redirect::to("/gameMenu0.html");
+        return Redirect::to("/gameMenu.html?error=Lobby%20not%20found");
     }
 
     let mut id = random();
@@ -273,14 +275,18 @@ fn join(lobby: String, name: String, games: &State<Games>, jar: &CookieJar<'_>) 
     let result = games.games.lock().unwrap()[&lobby].get().add_player(player);
     match result {
         Ok(()) => (),
-        Err(PlayerJoin::GameFull) => return Redirect::to("/gameMenu1.html"),
-        Err(PlayerJoin::GameAlreadyStarted) => return Redirect::to("/gameMenu2.html"),
+        Err(PlayerJoin::GameFull) => {
+            return Redirect::to("/gameMenu.html?error=The%20game%20is%20full")
+        }
+        Err(PlayerJoin::GameAlreadyStarted) => {
+            return Redirect::to("/gameMenu.html?error=This%20game%20already%20started")
+        }
     };
 
     jar.add_private(("lobby", lobby));
     jar.add_private(("userid", id.to_string()));
 
-    Redirect::to(uri!("/events"))
+    Redirect::to(uri!("/lobby.html"))
 }
 
 fn get_playerid(jar: &CookieJar<'_>) -> Result<<PlayerWrapper as game::Player>::ID, Status> {
@@ -449,34 +455,40 @@ fn cut(
     game: ProtectedGame,
     games: &State<Games>,
     jar: &CookieJar<'_>,
-) -> Result<(), &'static str> {
+) -> Result<(), BadRequest<&'static str>> {
     let Ok(playerid) = get_playerid(jar) else {
-        return Err("Invalid player id");
+        return Err(BadRequest("Invalid player id"));
     };
 
     if game.get().get_player(playerid).is_none() {
-        return Err("You are not part of this game");
+        return Err(BadRequest("You are not part of this game"));
     };
 
     if game.get().get_player(player).is_none() {
-        return Err("The player you specified is not part of this game");
+        return Err(BadRequest(
+            "The player you specified is not part of this game",
+        ));
     };
 
     let (cable, outcome) = match game.get().cut(playerid, player) {
         Ok(x) => x,
-        Err(errors::Cut::GameNotStarted) => return Err("This game hasn't started yet"),
-        Err(errors::Cut::DontHaveWireCutter) => return Err("You don't have the wire cutter"),
-        Err(errors::Cut::CannotSelfCut) => return Err("You can't cut one of your own cables"),
+        Err(errors::Cut::GameNotStarted) => return Err(BadRequest("This game hasn't started yet")),
+        Err(errors::Cut::DontHaveWireCutter) => {
+            return Err(BadRequest("You don't have the wire cutter"))
+        }
+        Err(errors::Cut::CannotSelfCut) => {
+            return Err(BadRequest("You can't cut one of your own cables"))
+        }
     };
 
     game.broadcast(&Message::Cut { player, cable });
 
     match outcome {
         CutOutcome::Nothing => (),
-        CutOutcome::Win(team) => game_won(games, &game, team),
+        CutOutcome::Win(team) => game_won(games, &game, team, jar),
         CutOutcome::RoundEnd => {
             if game.get().next_round() {
-                game_won(games, &game, Team::Moriarty);
+                game_won(games, &game, Team::Moriarty, jar);
             } else {
                 send_round(&game);
             }
@@ -499,7 +511,7 @@ fn send_round(game: &ProtectedGame) {
     }
 }
 
-fn game_won(games: &State<Games>, game: &ProtectedGame, team: Team) {
+fn game_won(games: &State<Games>, game: &ProtectedGame, team: Team, jar: &CookieJar<'_>) {
     let winning_players = game
         .get()
         .players()
@@ -514,6 +526,9 @@ fn game_won(games: &State<Games>, game: &ProtectedGame, team: Team) {
 
     let lobby = &game.get().name().to_owned();
     games.games.lock().unwrap().remove(lobby);
+
+    jar.remove_private("lobby");
+    jar.remove_private("userid");
 }
 
 #[get("/")]
