@@ -1,22 +1,77 @@
-use std::collections::HashMap;
+use rand::{
+    seq::{IteratorRandom, SliceRandom},
+    thread_rng,
+};
+use rocket::serde::Serialize;
+use std::{collections::HashMap, hash::Hash};
 
-use errors::PlayerJoinError;
-
-pub trait Player {
-    fn id(&self) -> usize;
-    fn connected(&self) -> bool;
-    fn set_connected(&mut self, connected: bool);
+macro_rules! repeated_vec {
+    ($($quantity:literal $value:expr),*) => {{
+        let mut v = Vec::with_capacity(repeated_vec!(@sum $($quantity)*));
+        $(
+            v.extend(std::iter::repeat($value).take($quantity));
+        )*
+        v
+    }};
+    (@sum $quantity:literal) => {
+        $quantity
+    };
+    (@sum $quantity:literal $($quantities:literal)*) => {
+        $quantity + repeated_vec!(@sum $($quantities)*)
+    };
 }
 
-enum GameState {
-    Lobby { ready_players: Vec<usize> },
-    Ingame,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(crate = "rocket::serde")]
+#[serde(rename_all = "lowercase")]
+pub enum Team {
+    Sherlock,
+    Moriarty,
+}
+
+pub trait Player {
+    type ID: Eq + Hash + Clone + Copy;
+
+    fn id(&self) -> Self::ID;
+    fn ready(&self) -> bool;
+    fn connected(&self) -> bool;
+
+    fn team(&self) -> Team;
+    fn set_team(&mut self, team: Team);
+
+    fn set_cables(&mut self, cables: Vec<Cable>);
+    fn cut_cable(&mut self) -> Cable;
+    fn cables(&self) -> &[Cable];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(crate = "rocket::serde")]
+#[serde(rename_all = "lowercase")]
+pub enum Cable {
+    Safe,
+    Defusing,
+    Bomb,
+}
+
+pub enum CutOutcome {
+    Win(Team),
+    RoundEnd,
+    Nothing,
+}
+
+enum GameState<PLAYER: Player> {
+    Lobby,
+    Ingame {
+        wire_cutters: PLAYER::ID,
+        defusing_remaining: u8,
+        cutted_count: u8,
+    },
 }
 
 pub struct Game<PLAYER: Player> {
     name: String,
-    players: HashMap<usize, PLAYER>,
-    state: GameState,
+    players: HashMap<PLAYER::ID, PLAYER>,
+    state: GameState<PLAYER>,
 }
 
 impl<PLAYER: Player> Game<PLAYER> {
@@ -24,9 +79,7 @@ impl<PLAYER: Player> Game<PLAYER> {
         Self {
             name,
             players: HashMap::new(),
-            state: GameState::Lobby {
-                ready_players: Vec::new(),
-            },
+            state: GameState::Lobby,
         }
     }
 
@@ -34,32 +87,190 @@ impl<PLAYER: Player> Game<PLAYER> {
         &self.name
     }
 
-    pub fn add_player(&mut self, player: PLAYER) -> Result<(), PlayerJoinError> {
-        match self.state {
-            GameState::Lobby { .. } => {
-                if self.players.len() >= 8 {
-                    return Err(PlayerJoinError::GameFull);
-                }
-
-                self.players
-                    .entry(player.id())
-                    .or_insert(player)
-                    .set_connected(true);
-
-                Ok(())
-            }
-            _ => Err(PlayerJoinError::GameAlreadyStarted),
+    pub const fn wire_cutters(&self) -> Option<PLAYER::ID> {
+        if let GameState::Ingame { wire_cutters, .. } = self.state {
+            Some(wire_cutters)
+        } else {
+            None
         }
     }
 
-    pub fn get_player(&self, id: usize) -> Option<&PLAYER> {
+    pub const fn players(&self) -> &HashMap<PLAYER::ID, PLAYER> {
+        &self.players
+    }
+
+    pub fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER> {
         self.players.get(&id)
+    }
+
+    pub fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER> {
+        self.players.get_mut(&id)
+    }
+
+    pub fn add_player(&mut self, player: PLAYER) -> Result<(), errors::PlayerJoin> {
+        match self.state {
+            GameState::Lobby { .. } => {
+                if self.players.len() >= 8 {
+                    return Err(errors::PlayerJoin::GameFull);
+                }
+
+                self.players.entry(player.id()).or_insert(player);
+
+                Ok(())
+            }
+            _ => Err(errors::PlayerJoin::GameAlreadyStarted),
+        }
+    }
+
+    pub fn remove_player(&mut self, id: PLAYER::ID) {
+        self.players.remove(&id);
+    }
+
+    pub const fn started(&self) -> bool {
+        matches!(self.state, GameState::Ingame { .. })
+    }
+
+    fn distribute_cables(&mut self, mut cables: Vec<Cable>) {
+        cables.shuffle(&mut thread_rng());
+
+        let cables_per_player = cables.len() / self.players.len();
+        for player in self.players.values_mut() {
+            player.set_cables(cables.split_off(cables.len() - cables_per_player));
+        }
+    }
+
+    pub fn start(&mut self) -> Result<(), errors::GameStart> {
+        if self.players.len() < 4 {
+            return Err(errors::GameStart::NotEnoughPlayers);
+        }
+        if !self.players.values().all(Player::ready) {
+            return Err(errors::GameStart::NotAllPlayersReady);
+        }
+
+        let mut teams = match self.players.len() {
+            4..=5 => repeated_vec![3 Team::Sherlock, 2 Team::Moriarty],
+            6 => repeated_vec![4 Team::Sherlock, 2 Team::Moriarty],
+            7..=8 => repeated_vec![5 Team::Sherlock, 3 Team::Moriarty],
+            _ => unreachable!(),
+        };
+        teams.shuffle(&mut thread_rng());
+
+        for player in self.players.values_mut() {
+            player.set_team(teams.pop().unwrap());
+        }
+
+        let (cables, defusing_cables) = match self.players.len() {
+            4 => (
+                repeated_vec![15 Cable::Safe, 4 Cable::Defusing, 1 Cable::Bomb],
+                4,
+            ),
+            5 => (
+                repeated_vec![19 Cable::Safe, 5 Cable::Defusing, 1 Cable::Bomb],
+                5,
+            ),
+            6 => (
+                repeated_vec![23 Cable::Safe, 6 Cable::Defusing, 1 Cable::Bomb],
+                6,
+            ),
+            7 => (
+                repeated_vec![27 Cable::Safe, 7 Cable::Defusing, 1 Cable::Bomb],
+                7,
+            ),
+            8 => (
+                repeated_vec![31 Cable::Safe, 8 Cable::Defusing, 1 Cable::Bomb],
+                8,
+            ),
+            _ => unreachable!(),
+        };
+
+        self.distribute_cables(cables);
+
+        self.state = GameState::Ingame {
+            wire_cutters: *self.players.keys().choose(&mut thread_rng()).unwrap(),
+            defusing_remaining: defusing_cables,
+            cutted_count: 0,
+        };
+
+        Ok(())
+    }
+
+    pub fn cut(
+        &mut self,
+        cutting: PLAYER::ID,
+        cutted: PLAYER::ID,
+    ) -> Result<(Cable, CutOutcome), errors::Cut> {
+        if let GameState::Ingame {
+            wire_cutters,
+            defusing_remaining,
+            cutted_count,
+        } = &mut self.state
+        {
+            if cutting != *wire_cutters {
+                return Err(errors::Cut::DontHaveWireCutter);
+            }
+            if cutted == cutting {
+                return Err(errors::Cut::CannotSelfCut);
+            }
+
+            let cable = self.players.get_mut(&cutted).unwrap().cut_cable();
+            *wire_cutters = cutted;
+            match cable {
+                Cable::Safe => *cutted_count += 1,
+                Cable::Defusing => {
+                    *defusing_remaining -= 1;
+                    *cutted_count += 1;
+                }
+                Cable::Bomb => return Ok((cable, CutOutcome::Win(Team::Moriarty))),
+            }
+            if *defusing_remaining == 0 {
+                return Ok((cable, CutOutcome::Win(Team::Sherlock)));
+            }
+
+            if *cutted_count == self.players.len() as u8 {
+                Ok((cable, CutOutcome::RoundEnd))
+            } else {
+                Ok((cable, CutOutcome::Nothing))
+            }
+        } else {
+            Err(errors::Cut::GameNotStarted)
+        }
+    }
+
+    pub fn next_round(&mut self) -> bool {
+        if let GameState::Ingame { cutted_count, .. } = &mut self.state {
+            *cutted_count = 0;
+
+            let cables: Vec<Cable> = self
+                .players
+                .values_mut()
+                .flat_map(|p| p.cables().to_owned())
+                .collect();
+
+            if cables.len() == self.players.len() {
+                return true;
+            }
+
+            self.distribute_cables(cables);
+        }
+
+        false
     }
 }
 
 pub mod errors {
-    pub enum PlayerJoinError {
+    pub enum PlayerJoin {
         GameFull,
         GameAlreadyStarted,
+    }
+
+    pub enum GameStart {
+        NotEnoughPlayers,
+        NotAllPlayersReady,
+    }
+
+    pub enum Cut {
+        GameNotStarted,
+        DontHaveWireCutter,
+        CannotSelfCut,
     }
 }
