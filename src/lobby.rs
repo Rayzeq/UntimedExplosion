@@ -66,6 +66,10 @@ enum Message {
         player: <Player as game::Player>::ID,
     },
     SelfLeave,
+    Ready {
+        player: <Player as gameplay::Player>::ID,
+        state: bool,
+    }
 }
 
 impl Message {
@@ -76,6 +80,7 @@ impl Message {
             Self::Join { .. } => "join",
             Self::Leave { .. } => "leave",
             Self::SelfLeave { .. } => unreachable!(),
+            Self::Ready { .. } => "ready",
         }
     }
 }
@@ -245,6 +250,25 @@ fn events<'a>(
     }.heartbeat(Duration::from_secs(5))
 }
 
+#[get("/lobby/ready?<state>")]
+#[allow(clippy::needless_pass_by_value)]
+fn ready(state: bool, lobby: Protected<Player, Lobby<Player>>, jar: &CookieJar<'_>) {
+    let Some(Ok(id)) = jar
+        .get_private("id")
+        .map(|x| x.value().parse::<<Player as gameplay::Player>::ID>())
+    else {
+        return;
+    };
+
+    if lobby.lock().get_player(id).is_some() {
+        lobby.lock().get_player_mut(id).unwrap().ready = state;
+        lobby.broadcast(&Message::Ready {
+            player: id,
+            state,
+        });
+    };
+}
+
 #[get("/lobby/leave")]
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
@@ -268,5 +292,5 @@ fn leave(lobby: Option<Protected<Player, Lobby<Player>>>, jar: &CookieJar<'_>) -
 }
 
 pub fn routes() -> Vec<rocket::Route> {
-    routes![create, join, events, leave]
+    routes![create, join, events, ready, leave]
 }
