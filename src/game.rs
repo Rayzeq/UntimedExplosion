@@ -2,7 +2,7 @@ use rand::{
     seq::{IteratorRandom, SliceRandom},
     thread_rng,
 };
-use rocket::serde::Serialize;
+use rocket::serde::{Deserialize, Serialize};
 use std::{collections::HashMap, hash::Hash};
 
 macro_rules! repeated_vec {
@@ -21,7 +21,7 @@ macro_rules! repeated_vec {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rocket::serde")]
 #[serde(rename_all = "lowercase")]
 pub enum Team {
@@ -29,11 +29,108 @@ pub enum Team {
     Moriarty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "rocket::serde")]
+#[serde(rename_all = "lowercase")]
+pub enum Cable {
+    Safe,
+    Defusing,
+    Bomb,
+}
+
 pub trait Player {
     type ID: Eq + Hash + Clone + Copy;
 
     fn id(&self) -> Self::ID;
+}
+
+pub trait Room<PLAYER: Player> {
+    fn name(&self) -> &str;
+    fn players(&self) -> &HashMap<PLAYER::ID, PLAYER>;
+    fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER>;
+    fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER>;
+}
+
+pub trait WaitingPlayer: Player {
     fn ready(&self) -> bool;
+}
+
+pub struct Lobby<PLAYER: WaitingPlayer> {
+    name: String,
+    players: HashMap<PLAYER::ID, PLAYER>,
+}
+
+impl<PLAYER: WaitingPlayer> Lobby<PLAYER> {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            players: HashMap::new(),
+        }
+    }
+
+    pub fn add_player(&mut self, player: PLAYER) -> Result<(), errors::Join> {
+        if self.players.len() >= 8 {
+            return Err(errors::Join::GameFull);
+        }
+
+        if self.players.contains_key(&player.id()) {
+            return Err(errors::Join::AlreadyConnected);
+        }
+        self.players.insert(player.id(), player);
+
+        Ok(())
+    }
+
+    pub fn remove_player(&mut self, id: PLAYER::ID) {
+        self.players.remove(&id);
+    }
+}
+
+impl<PLAYER: WaitingPlayer> Room<PLAYER> for Lobby<PLAYER> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn players(&self) -> &HashMap<PLAYER::ID, PLAYER> {
+        &self.players
+    }
+
+    fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER> {
+        self.players.get(&id)
+    }
+
+    fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER> {
+        self.players.get_mut(&id)
+    }
+}
+
+pub mod errors {
+    use thiserror::Error;
+
+    #[derive(Error, Debug, Clone, Copy)]
+    pub enum Join {
+        #[error("this game is already full")]
+        GameFull,
+        #[error("you are already connected to this game")]
+        AlreadyConnected,
+    }
+}
+
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+
+pub trait OldPlayer: WaitingPlayer {
     fn connected(&self) -> bool;
 
     fn team(&self) -> Team;
@@ -44,22 +141,13 @@ pub trait Player {
     fn cables(&self) -> &[Cable];
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(crate = "rocket::serde")]
-#[serde(rename_all = "lowercase")]
-pub enum Cable {
-    Safe,
-    Defusing,
-    Bomb,
-}
-
 pub enum CutOutcome {
     Win(Team),
     RoundEnd,
     Nothing,
 }
 
-enum GameState<PLAYER: Player> {
+enum GameState<PLAYER: OldPlayer> {
     Lobby,
     Ingame {
         wire_cutters: PLAYER::ID,
@@ -68,13 +156,31 @@ enum GameState<PLAYER: Player> {
     },
 }
 
-pub struct Game<PLAYER: Player> {
+pub struct Game<PLAYER: OldPlayer> {
     name: String,
     players: HashMap<PLAYER::ID, PLAYER>,
     state: GameState<PLAYER>,
 }
 
-impl<PLAYER: Player> Game<PLAYER> {
+impl<PLAYER: Player + OldPlayer> Room<PLAYER> for Game<PLAYER> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn players(&self) -> &HashMap<PLAYER::ID, PLAYER> {
+        &self.players
+    }
+
+    fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER> {
+        self.players.get(&id)
+    }
+
+    fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER> {
+        self.players.get_mut(&id)
+    }
+}
+
+impl<PLAYER: OldPlayer> Game<PLAYER> {
     pub fn new(name: String) -> Self {
         Self {
             name,
@@ -83,42 +189,11 @@ impl<PLAYER: Player> Game<PLAYER> {
         }
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     pub const fn wire_cutters(&self) -> Option<PLAYER::ID> {
         if let GameState::Ingame { wire_cutters, .. } = self.state {
             Some(wire_cutters)
         } else {
             None
-        }
-    }
-
-    pub const fn players(&self) -> &HashMap<PLAYER::ID, PLAYER> {
-        &self.players
-    }
-
-    pub fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER> {
-        self.players.get(&id)
-    }
-
-    pub fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER> {
-        self.players.get_mut(&id)
-    }
-
-    pub fn add_player(&mut self, player: PLAYER) -> Result<(), errors::PlayerJoin> {
-        match self.state {
-            GameState::Lobby { .. } => {
-                if self.players.len() >= 8 {
-                    return Err(errors::PlayerJoin::GameFull);
-                }
-
-                self.players.entry(player.id()).or_insert(player);
-
-                Ok(())
-            }
-            _ => Err(errors::PlayerJoin::GameAlreadyStarted),
         }
     }
 
@@ -147,12 +222,12 @@ impl<PLAYER: Player> Game<PLAYER> {
         }
     }
 
-    pub fn start(&mut self) -> Result<(), errors::GameStart> {
+    pub fn start(&mut self) -> Result<(), old_errors::GameStart> {
         if self.players.len() < 4 {
-            return Err(errors::GameStart::NotEnoughPlayers);
+            return Err(old_errors::GameStart::NotEnoughPlayers);
         }
-        if !self.players.values().all(Player::ready) {
-            return Err(errors::GameStart::NotAllPlayersReady);
+        if !self.players.values().all(WaitingPlayer::ready) {
+            return Err(old_errors::GameStart::NotAllPlayersReady);
         }
 
         let mut teams = match self.players.len() {
@@ -185,7 +260,7 @@ impl<PLAYER: Player> Game<PLAYER> {
         &mut self,
         cutting: PLAYER::ID,
         cutted: PLAYER::ID,
-    ) -> Result<(Cable, CutOutcome), errors::Cut> {
+    ) -> Result<(Cable, CutOutcome), old_errors::Cut> {
         if let GameState::Ingame {
             wire_cutters,
             defusing_remaining,
@@ -193,10 +268,10 @@ impl<PLAYER: Player> Game<PLAYER> {
         } = &mut self.state
         {
             if cutting != *wire_cutters {
-                return Err(errors::Cut::DontHaveWireCutter);
+                return Err(old_errors::Cut::DontHaveWireCutter);
             }
             if cutted == cutting {
-                return Err(errors::Cut::CannotSelfCut);
+                return Err(old_errors::Cut::CannotSelfCut);
             }
 
             let cable = self.players.get_mut(&cutted).unwrap().cut_cable();
@@ -219,7 +294,7 @@ impl<PLAYER: Player> Game<PLAYER> {
                 Ok((cable, CutOutcome::Nothing))
             }
         } else {
-            Err(errors::Cut::GameNotStarted)
+            Err(old_errors::Cut::GameNotStarted)
         }
     }
 
@@ -244,12 +319,7 @@ impl<PLAYER: Player> Game<PLAYER> {
     }
 }
 
-pub mod errors {
-    pub enum PlayerJoin {
-        GameFull,
-        GameAlreadyStarted,
-    }
-
+pub mod old_errors {
     pub enum GameStart {
         NotEnoughPlayers,
         NotAllPlayersReady,

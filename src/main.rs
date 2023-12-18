@@ -1,11 +1,6 @@
 #![allow(clippy::option_if_let_else, clippy::no_effect_underscore_binding)]
 
-use rand::{
-    distributions::{Alphanumeric, DistString},
-    random,
-    seq::SliceRandom,
-    thread_rng,
-};
+use rand::{seq::SliceRandom, thread_rng};
 use rocket::{
     fs::{relative, FileServer},
     get,
@@ -21,26 +16,26 @@ use rocket::{
     serde::Serialize,
     tokio::{
         select,
-        sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        sync::mpsc::{UnboundedReceiver, UnboundedSender},
     },
-    uri, Shutdown, State,
+    Shutdown, State,
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::sync::Mutex;
 
+mod common;
 mod game;
+mod lobby;
 
-use game::{
-    errors::{self, PlayerJoin},
-    Cable, CutOutcome, Game, Player as _, Team,
-};
+use common::{GlobalState, Protected};
+use game::{old_errors, Cable, CutOutcome, Game, OldPlayer as _, Room, Team};
+
+// TODO: auto-delete created game if nobody joins
+// TODO: delete game when it goes empty
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(crate = "rocket::serde")]
 #[serde(untagged)]
-enum Message {
+pub enum Message {
     Error {
         reason: String,
     },
@@ -97,7 +92,7 @@ impl Message {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(crate = "rocket::serde")]
-struct Player {
+pub struct Player {
     id: <PlayerWrapper as game::Player>::ID,
     pub name: String,
     pub ready: bool,
@@ -119,7 +114,7 @@ impl Player {
 }
 
 #[derive(Debug)]
-struct PlayerWrapper {
+pub struct PlayerWrapper {
     pub inner: Player,
     pub sender: UnboundedSender<Message>,
     // only present if no SSE stream is currently using it
@@ -133,11 +128,15 @@ impl game::Player for PlayerWrapper {
     fn id(&self) -> Self::ID {
         self.inner.id
     }
+}
 
+impl game::WaitingPlayer for PlayerWrapper {
     fn ready(&self) -> bool {
         self.inner.ready
     }
+}
 
+impl game::OldPlayer for PlayerWrapper {
     fn connected(&self) -> bool {
         self.receiver.is_none()
     }
@@ -166,38 +165,28 @@ impl game::Player for PlayerWrapper {
     }
 }
 
-struct ProtectedGame(Arc<Mutex<Game<PlayerWrapper>>>);
-
-impl ProtectedGame {
-    pub fn new(name: String) -> Self {
-        Self(Arc::new(Mutex::new(Game::new(name))))
-    }
-
-    pub fn get(&self) -> MutexGuard<Game<PlayerWrapper>> {
-        self.0.lock().unwrap()
-    }
-
+impl Protected<PlayerWrapper, Game<PlayerWrapper>> {
     pub fn broadcast(&self, msg: &Message) {
-        for player in self.get().players().values() {
+        for player in self.lock().players().values() {
             player.sender.send(msg.clone()).unwrap();
         }
     }
 }
 
-impl Clone for ProtectedGame {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+impl Protected<PlayerWrapper, Game<PlayerWrapper>> {
+    pub fn new_game(name: String) -> Self {
+        Self::new(Game::new(name))
     }
 }
 
 #[rocket::async_trait]
-impl<'r> FromRequest<'r> for ProtectedGame {
+impl<'r> FromRequest<'r> for Protected<PlayerWrapper, Game<PlayerWrapper>> {
     type Error = ();
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         if let Some(lobby) = request.cookies().get_private("lobby") {
             let games = request
-                .guard::<&State<Games>>()
+                .guard::<&State<GlobalState>>()
                 .await
                 .unwrap()
                 .games
@@ -214,81 +203,6 @@ impl<'r> FromRequest<'r> for ProtectedGame {
     }
 }
 
-struct Games {
-    pub games: Mutex<HashMap<String, ProtectedGame>>,
-}
-
-impl Games {
-    pub fn new() -> Self {
-        Self {
-            games: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-#[get("/create?<name>&<id>")]
-#[must_use]
-fn create(name: String, id: Option<String>, games: &State<Games>) -> Redirect {
-    let mut id = id.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::thread_rng(), 6));
-
-    {
-        let mut games = games.games.lock().unwrap();
-
-        while games.contains_key(&id) {
-            id = Alphanumeric.sample_string(&mut rand::thread_rng(), 6);
-        }
-        id = id.to_uppercase();
-
-        games.insert(id.clone(), ProtectedGame::new(id.clone()));
-    }
-
-    Redirect::to(uri!(join(id, name)))
-}
-
-// TODO: if a player join but never call /events, he will be in the game even though he is not really here
-#[get("/join?<lobby>&<name>")]
-#[must_use]
-fn join(lobby: &str, name: String, games: &State<Games>, jar: &CookieJar<'_>) -> Redirect {
-    let lobby = lobby.to_uppercase();
-
-    if !games.games.lock().unwrap().contains_key(&lobby) {
-        return Redirect::to("/gameMenu.html?error=Lobby%20not%20found");
-    }
-
-    let mut id = random();
-    while games.games.lock().unwrap()[&lobby]
-        .get()
-        .players()
-        .contains_key(&id)
-    {
-        id = random();
-    }
-
-    let (sender, receiver) = unbounded_channel();
-    let player = PlayerWrapper {
-        inner: Player::new(id, name),
-        sender,
-        receiver: Some(Mutex::new(receiver)),
-        team: None,
-    };
-
-    let result = games.games.lock().unwrap()[&lobby].get().add_player(player);
-    match result {
-        Ok(()) => (),
-        Err(PlayerJoin::GameFull) => {
-            return Redirect::to("/gameMenu.html?error=The%20game%20is%20full")
-        }
-        Err(PlayerJoin::GameAlreadyStarted) => {
-            return Redirect::to("/gameMenu.html?error=This%20game%20already%20started")
-        }
-    };
-
-    jar.add_private(("lobby", lobby));
-    jar.add_private(("userid", id.to_string()));
-
-    Redirect::to(uri!("/lobby.html"))
-}
-
 fn get_playerid(jar: &CookieJar<'_>) -> Result<<PlayerWrapper as game::Player>::ID, Status> {
     if let Some(id) = jar.get_private("userid") {
         id.value().parse().map_err(|_| Status::BadRequest)
@@ -298,7 +212,7 @@ fn get_playerid(jar: &CookieJar<'_>) -> Result<<PlayerWrapper as game::Player>::
 }
 
 struct ConnectionGuard {
-    game: ProtectedGame,
+    game: Protected<PlayerWrapper, Game<PlayerWrapper>>,
     playerid: <PlayerWrapper as game::Player>::ID,
     receiver: Option<UnboundedReceiver<Message>>,
 }
@@ -309,14 +223,14 @@ impl Drop for ConnectionGuard {
             player: self.playerid,
         });
         self.game
-            .get()
+            .lock()
             .get_player_mut(self.playerid)
             .unwrap()
             .receiver
             .replace(Mutex::new(self.receiver.take().unwrap()));
 
-        if !self.game.get().started() {
-            self.game.get().remove_player(self.playerid);
+        if !self.game.lock().started() {
+            self.game.lock().remove_player(self.playerid);
         }
     }
 }
@@ -325,7 +239,7 @@ impl Drop for ConnectionGuard {
 #[get("/events")]
 #[must_use]
 fn events<'a>(
-    game: ProtectedGame,
+    game: Protected<PlayerWrapper, Game<PlayerWrapper>>,
     jar: &'a CookieJar<'a>,
     mut end: Shutdown,
 ) -> EventStream![Event + 'a] {
@@ -347,14 +261,14 @@ fn events<'a>(
             }
         };
 
-        if game.get().get_player(playerid).is_none() {
+        if game.lock().get_player(playerid).is_none() {
             yield make_event!(Message::Error {
                     reason: "You are not part of this game".to_owned(),
                 });
             return;
         };
-        let player = game.get().get_player(playerid).unwrap().inner.clone();
-        let Some(receiver) = game.get().get_player_mut(playerid).unwrap().receiver.take() else {
+        let player = game.lock().get_player(playerid).unwrap().inner.clone();
+        let Some(receiver) = game.lock().get_player_mut(playerid).unwrap().receiver.take() else {
             yield make_event!(Message::Error {
                     reason: "You are already connected to this game".to_owned(),
                 });
@@ -363,10 +277,10 @@ fn events<'a>(
         let receiver = receiver.into_inner().unwrap();
         game.broadcast(&Message::Join { player: player.clone() });
 
-        let lobby_name = game.get().name().to_owned();
-        let player_list = game.get().players().values().map(|p| p.inner.clone()).collect();
-        let team = game.get().get_player(playerid).unwrap().team;
-        let wire_cutters = game.get().wire_cutters();
+        let lobby_name = game.lock().name().to_owned();
+        let player_list = game.lock().players().values().map(|p| p.inner.clone()).collect();
+        let team = game.lock().get_player(playerid).unwrap().team;
+        let wire_cutters = game.lock().wire_cutters();
         yield make_event!(Message::Initialize { lobby: lobby_name, players: player_list, team, wire_cutters });
 
         let mut guard = ConnectionGuard {
@@ -380,7 +294,12 @@ fn events<'a>(
         loop {
             let msg = select! {
                 msg = receiver.recv() => msg,
-                _ = &mut end => break,
+                _ = &mut end => {
+                    yield make_event!(Message::Error {
+                        reason: "Server closed".to_owned(),
+                    });
+                    break
+                },
             };
             let Some(msg) = msg else {
                 break;
@@ -400,12 +319,12 @@ fn events<'a>(
 
 #[get("/leave")]
 #[must_use]
-fn leave(game: ProtectedGame, jar: &CookieJar<'_>) -> Redirect {
+fn leave(game: Protected<PlayerWrapper, Game<PlayerWrapper>>, jar: &CookieJar<'_>) -> Redirect {
     let Ok(playerid) = get_playerid(jar) else {
         return Redirect::to("/gameMenu.html");
     };
 
-    if let Some(player) = game.get().get_player(playerid) {
+    if let Some(player) = game.lock().get_player(playerid) {
         player.sender.send(Message::SelfLeave).unwrap();
     }
 
@@ -416,13 +335,13 @@ fn leave(game: ProtectedGame, jar: &CookieJar<'_>) -> Redirect {
 }
 
 #[get("/ready?<state>")]
-fn ready(state: bool, game: ProtectedGame, jar: &CookieJar<'_>) {
+fn ready(state: bool, game: Protected<PlayerWrapper, Game<PlayerWrapper>>, jar: &CookieJar<'_>) {
     let Ok(playerid) = get_playerid(jar) else {
         return;
     };
 
-    if game.get().get_player(playerid).is_some() {
-        game.get().get_player_mut(playerid).unwrap().inner.ready = state;
+    if game.lock().get_player(playerid).is_some() {
+        game.lock().get_player_mut(playerid).unwrap().inner.ready = state;
         game.broadcast(&Message::Ready {
             player: playerid,
             state,
@@ -431,12 +350,12 @@ fn ready(state: bool, game: ProtectedGame, jar: &CookieJar<'_>) {
 }
 
 #[get("/start")]
-fn start(game: ProtectedGame) -> Status {
-    if game.get().start().is_err() {
+fn start(game: Protected<PlayerWrapper, Game<PlayerWrapper>>) -> Status {
+    if game.lock().start().is_err() {
         return Status::PreconditionRequired;
     }
 
-    for player in game.get().players().values() {
+    for player in game.lock().players().values() {
         player
             .sender
             .send(Message::Start {
@@ -452,31 +371,33 @@ fn start(game: ProtectedGame) -> Status {
 #[get("/cut?<player>")]
 fn cut(
     player: <PlayerWrapper as game::Player>::ID,
-    game: ProtectedGame,
-    games: &State<Games>,
+    game: Protected<PlayerWrapper, Game<PlayerWrapper>>,
+    games: &State<GlobalState>,
     jar: &CookieJar<'_>,
 ) -> Result<(), BadRequest<&'static str>> {
     let Ok(playerid) = get_playerid(jar) else {
         return Err(BadRequest("Invalid player id"));
     };
 
-    if game.get().get_player(playerid).is_none() {
+    if game.lock().get_player(playerid).is_none() {
         return Err(BadRequest("You are not part of this game"));
     };
 
-    if game.get().get_player(player).is_none() {
+    if game.lock().get_player(player).is_none() {
         return Err(BadRequest(
             "The player you specified is not part of this game",
         ));
     };
 
-    let (cable, outcome) = match game.get().cut(playerid, player) {
+    let (cable, outcome) = match game.lock().cut(playerid, player) {
         Ok(x) => x,
-        Err(errors::Cut::GameNotStarted) => return Err(BadRequest("This game hasn't started yet")),
-        Err(errors::Cut::DontHaveWireCutter) => {
+        Err(old_errors::Cut::GameNotStarted) => {
+            return Err(BadRequest("This game hasn't started yet"))
+        }
+        Err(old_errors::Cut::DontHaveWireCutter) => {
             return Err(BadRequest("You don't have the wire cutter"))
         }
-        Err(errors::Cut::CannotSelfCut) => {
+        Err(old_errors::Cut::CannotSelfCut) => {
             return Err(BadRequest("You can't cut one of your own cables"))
         }
     };
@@ -487,7 +408,7 @@ fn cut(
         CutOutcome::Nothing => (),
         CutOutcome::Win(team) => game_won(games, &game, team, jar),
         CutOutcome::RoundEnd => {
-            if game.get().next_round() {
+            if game.lock().next_round() {
                 game_won(games, &game, Team::Moriarty, jar);
             } else {
                 send_round(&game);
@@ -498,9 +419,9 @@ fn cut(
     Ok(())
 }
 
-fn send_round(game: &ProtectedGame) {
-    let wire_cutters = game.get().wire_cutters();
-    for player in game.get().players().values() {
+fn send_round(game: &Protected<PlayerWrapper, Game<PlayerWrapper>>) {
+    let wire_cutters = game.lock().wire_cutters();
+    for player in game.lock().players().values() {
         player
             .sender
             .send(Message::RoundStart {
@@ -511,9 +432,14 @@ fn send_round(game: &ProtectedGame) {
     }
 }
 
-fn game_won(games: &State<Games>, game: &ProtectedGame, team: Team, jar: &CookieJar<'_>) {
+fn game_won(
+    games: &State<GlobalState>,
+    game: &Protected<PlayerWrapper, Game<PlayerWrapper>>,
+    team: Team,
+    jar: &CookieJar<'_>,
+) {
     let winning_players = game
-        .get()
+        .lock()
         .players()
         .values()
         .filter(|p| p.team() == team)
@@ -524,7 +450,7 @@ fn game_won(games: &State<Games>, game: &ProtectedGame, team: Team, jar: &Cookie
         players: winning_players,
     });
 
-    let lobby = &game.get().name().to_owned();
+    let lobby = &game.lock().name().to_owned();
     games.games.lock().unwrap().remove(lobby);
 
     jar.remove_private("lobby");
@@ -539,10 +465,8 @@ fn index() -> Redirect {
 #[launch]
 fn rocket() -> _ {
     rocket::build()
-        .manage(Games::new())
+        .manage(GlobalState::new())
         .mount("/", FileServer::from(relative!("static")))
-        .mount(
-            "/",
-            routes![index, create, join, events, leave, ready, start, cut],
-        )
+        .mount("/", routes![index, events, leave, ready, start, cut])
+        .mount("/", lobby::routes())
 }
