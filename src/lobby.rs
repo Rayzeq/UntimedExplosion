@@ -139,16 +139,19 @@ impl Drop for ConnectionGuard {
 #[get("/lobby/create?<id>&<name>")]
 #[must_use]
 fn create(id: Option<String>, name: String, state: &State<GlobalState>) -> Redirect {
-    let mut id = id.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::thread_rng(), 6));
+    let mut id = id
+        .unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::thread_rng(), 6))
+        .to_uppercase();
 
     {
         let mut lobbys = state.lobbys.lock().unwrap();
         let games = state.games.lock().unwrap();
 
         while lobbys.contains_key(&id) || games.contains_key(&id) {
-            id = Alphanumeric.sample_string(&mut rand::thread_rng(), 6);
+            id = Alphanumeric
+                .sample_string(&mut rand::thread_rng(), 6)
+                .to_uppercase();
         }
-        id = id.to_uppercase();
 
         lobbys.insert(id.clone(), Protected::new(Lobby::new(id.clone())));
     }
