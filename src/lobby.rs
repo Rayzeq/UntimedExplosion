@@ -143,8 +143,9 @@ fn create(id: Option<String>, name: String, state: &State<GlobalState>) -> Redir
 
     {
         let mut lobbys = state.lobbys.lock().unwrap();
+        let games = state.games.lock().unwrap();
 
-        while lobbys.contains_key(&id) {
+        while lobbys.contains_key(&id) || games.contains_key(&id) {
             id = Alphanumeric.sample_string(&mut rand::thread_rng(), 6);
         }
         id = id.to_uppercase();

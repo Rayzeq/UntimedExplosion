@@ -17,7 +17,6 @@ use common::GlobalState;
 // TODO: auto-delete created game / lobby if nobody joins
 // TODO: delete lobby when it goes empty
 // TODO: delete game if everyone disconnects (after 1 min to let people time to reconnect)
-// TODO: prevent creating a lobby with the same name as a game
 
 #[get("/")]
 fn index() -> Redirect {
