@@ -14,8 +14,7 @@ mod lobby;
 
 use common::GlobalState;
 
-// TODO: auto-delete created game / lobby if nobody joins
-// TODO: delete lobby when it goes empty
+// TODO: auto-delete created game if nobody joins
 // TODO: delete game if everyone disconnects (after 1 min to let people time to reconnect)
 
 #[get("/")]

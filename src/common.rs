@@ -1,11 +1,10 @@
 use crate::{
     game,
-    gameplay::{Game, Lobby, Player, Room},
+    gameplay::{Game, Lobby},
     lobby,
 };
 use std::{
     collections::HashMap,
-    marker::PhantomData,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -19,33 +18,33 @@ macro_rules! make_event {
 pub(crate) use make_event;
 
 pub struct GlobalState {
-    pub lobbys: Mutex<HashMap<String, Protected<lobby::Player, Lobby<lobby::Player>>>>,
-    pub games: Mutex<HashMap<String, Protected<game::Player, Game<game::Player>>>>,
+    pub lobbys: Arc<Mutex<HashMap<String, Protected<Lobby<lobby::Player>>>>>,
+    pub games: Arc<Mutex<HashMap<String, Protected<Game<game::Player>>>>>,
 }
 
 impl GlobalState {
     pub fn new() -> Self {
         Self {
-            lobbys: Mutex::new(HashMap::new()),
-            games: Mutex::new(HashMap::new()),
+            lobbys: Arc::new(Mutex::new(HashMap::new())),
+            games: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-pub struct Protected<PLAYER: Player, ROOM: Room<PLAYER>>(Arc<Mutex<ROOM>>, PhantomData<PLAYER>);
+pub struct Protected<T>(Arc<Mutex<T>>);
 
-impl<PLAYER: Player, ROOM: Room<PLAYER>> Protected<PLAYER, ROOM> {
-    pub fn new(content: ROOM) -> Self {
-        Self(Arc::new(Mutex::new(content)), PhantomData)
+impl<T> Protected<T> {
+    pub fn new(content: T) -> Self {
+        Self(Arc::new(Mutex::new(content)))
     }
 
-    pub fn lock(&self) -> MutexGuard<ROOM> {
+    pub fn lock(&self) -> MutexGuard<T> {
         self.0.lock().unwrap()
     }
 }
 
-impl<PLAYER: Player, ROOM: Room<PLAYER>> Clone for Protected<PLAYER, ROOM> {
+impl<T> Clone for Protected<T> {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0), PhantomData)
+        Self(Arc::clone(&self.0))
     }
 }

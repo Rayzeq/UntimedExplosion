@@ -148,7 +148,7 @@ impl Message {
     }
 }
 
-impl Protected<Player, Game<Player>> {
+impl Protected<Game<Player>> {
     #[allow(clippy::significant_drop_in_scrutinee)]
     fn broadcast(&self, msg: &Message) {
         for player in self.lock().players().values() {
@@ -158,7 +158,7 @@ impl Protected<Player, Game<Player>> {
 }
 
 #[rocket::async_trait]
-impl<'r> FromRequest<'r> for Protected<Player, Game<Player>> {
+impl<'r> FromRequest<'r> for Protected<Game<Player>> {
     type Error = ();
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
@@ -181,7 +181,7 @@ impl<'r> FromRequest<'r> for Protected<Player, Game<Player>> {
 }
 
 struct ConnectionGuard {
-    game: Protected<Player, Game<Player>>,
+    game: Protected<Game<Player>>,
     id: <Player as gameplay::Player>::ID,
     // we need the Option here because the destructor takes self by reference
     // which mean we need Option::take to save the receiver from being destroyed
@@ -201,7 +201,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
-fn send_round(game: &Protected<Player, Game<Player>>) {
+fn send_round(game: &Protected<Game<Player>>) {
     #[allow(clippy::significant_drop_in_scrutinee)]
     for player in game.lock().players().values() {
         player
@@ -215,7 +215,7 @@ fn send_round(game: &Protected<Player, Game<Player>>) {
 
 fn game_won(
     state: &State<GlobalState>,
-    game: &Protected<Player, Game<Player>>,
+    game: &Protected<Game<Player>>,
     team: Team,
     jar: &CookieJar<'_>,
 ) {
@@ -243,7 +243,7 @@ fn game_won(
 #[get("/game/events")]
 #[must_use]
 fn events<'a>(
-    game: Option<Protected<Player, Game<Player>>>,
+    game: Option<Protected<Game<Player>>>,
     jar: &'a CookieJar<'_>,
     mut end: Shutdown,
 ) -> EventStream![Event + 'a] {
@@ -327,7 +327,7 @@ fn events<'a>(
 #[allow(clippy::needless_pass_by_value)]
 fn cut(
     player: <Player as gameplay::Player>::ID,
-    game: Protected<Player, Game<Player>>,
+    game: Protected<Game<Player>>,
     state: &State<GlobalState>,
     jar: &CookieJar<'_>,
 ) -> Result<(), BadRequest<&'static str>> {

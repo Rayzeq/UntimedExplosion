@@ -18,12 +18,16 @@ use rocket::{
     routes,
     serde::Serialize,
     tokio::{
-        select,
+        self, select,
         sync::mpsc::{unbounded_channel, UnboundedSender},
     },
     uri, Shutdown, State,
 };
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(crate = "rocket::serde")]
@@ -92,7 +96,7 @@ impl Message {
     }
 }
 
-impl Protected<Player, Lobby<Player>> {
+impl Protected<Lobby<Player>> {
     #[allow(clippy::significant_drop_in_scrutinee)]
     fn broadcast(&self, msg: &Message) {
         for player in self.lock().players().values() {
@@ -102,7 +106,7 @@ impl Protected<Player, Lobby<Player>> {
 }
 
 #[rocket::async_trait]
-impl<'r> FromRequest<'r> for Protected<Player, Lobby<Player>> {
+impl<'r> FromRequest<'r> for Protected<Lobby<Player>> {
     type Error = ();
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
@@ -124,15 +128,23 @@ impl<'r> FromRequest<'r> for Protected<Player, Lobby<Player>> {
     }
 }
 
-struct ConnectionGuard {
-    lobby: Protected<Player, Lobby<Player>>,
+struct ConnectionGuard<'a> {
+    lobbys: &'a Mutex<HashMap<String, Protected<Lobby<Player>>>>,
+    lobby: Protected<Lobby<Player>>,
     id: <Player as gameplay::Player>::ID,
 }
 
-impl Drop for ConnectionGuard {
+impl<'a> Drop for ConnectionGuard<'a> {
     fn drop(&mut self) {
         self.lobby.broadcast(&Message::Leave { player: self.id });
-        self.lobby.lock().remove_player(self.id);
+        {
+            let mut lobby = self.lobby.lock();
+            lobby.remove_player(self.id);
+
+            if lobby.players().is_empty() {
+                self.lobbys.lock().unwrap().remove(lobby.name());
+            }
+        }
     }
 }
 
@@ -156,7 +168,23 @@ fn create(id: Option<String>, name: String, state: &State<GlobalState>) -> Redir
         lobbys.insert(id.clone(), Protected::new(Lobby::new(id.clone())));
     }
 
-    Redirect::to(uri!(join(id, name)))
+    let id_copy = id.clone();
+    let lobbys_ref = Arc::downgrade(&state.lobbys);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let lobbys = lobbys_ref.upgrade()?;
+        {
+            let mut lobbys = lobbys.lock().unwrap();
+
+            if lobbys.get(&id)?.lock().players().is_empty() {
+                lobbys.remove(&id);
+            }
+        }
+
+        Some(())
+    });
+
+    Redirect::to(uri!(join(id_copy, name)))
 }
 
 #[get("/lobby/join?<lobby>&<name>")]
@@ -185,7 +213,8 @@ fn join(lobby: &str, name: String, state: &State<GlobalState>, jar: &CookieJar<'
 #[get("/lobby/events")]
 #[must_use]
 fn events<'a>(
-    lobby: Option<Protected<Player, Lobby<Player>>>,
+    lobby: Option<Protected<Lobby<Player>>>,
+    state: &'a State<GlobalState>,
     jar: &'a CookieJar<'_>,
     mut end: Shutdown,
 ) -> EventStream![Event + 'a] {
@@ -239,7 +268,7 @@ fn events<'a>(
 
         lobby.broadcast(&Message::Join { player });
 
-        let guard = ConnectionGuard { lobby, id };
+        let guard = ConnectionGuard { lobbys: &state.lobbys, lobby, id };
 
         loop {
             let Some(msg) = select! {
@@ -268,7 +297,7 @@ fn events<'a>(
 
 #[get("/lobby/ready?<state>")]
 #[allow(clippy::needless_pass_by_value)]
-fn ready(state: bool, lobby: Protected<Player, Lobby<Player>>, jar: &CookieJar<'_>) {
+fn ready(state: bool, lobby: Protected<Lobby<Player>>, jar: &CookieJar<'_>) {
     let Some(Ok(id)) = jar
         .get_private("id")
         .map(|x| x.value().parse::<<Player as gameplay::Player>::ID>())
@@ -284,7 +313,7 @@ fn ready(state: bool, lobby: Protected<Player, Lobby<Player>>, jar: &CookieJar<'
 
 #[get("/lobby/leave")]
 #[must_use]
-fn leave(lobby: Option<Protected<Player, Lobby<Player>>>, jar: &CookieJar<'_>) -> Redirect {
+fn leave(lobby: Option<Protected<Lobby<Player>>>, jar: &CookieJar<'_>) -> Redirect {
     if let Some(Ok(id)) = jar
         .get_private("id")
         .map(|x| x.value().parse::<<Player as gameplay::Player>::ID>())
