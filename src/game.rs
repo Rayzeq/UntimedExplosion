@@ -14,12 +14,16 @@ use rocket::{
     routes,
     serde::Serialize,
     tokio::{
-        select,
+        self, select,
         sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     },
     Shutdown, State,
 };
-use std::{sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 
 #[derive(Debug)]
 pub struct Player {
@@ -186,18 +190,46 @@ struct ConnectionGuard {
     // we need the Option here because the destructor takes self by reference
     // which mean we need Option::take to save the receiver from being destroyed
     receiver: Option<UnboundedReceiver<Message>>,
+    games: Option<Weak<Mutex<HashMap<String, Protected<Game<Player>>>>>>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.game
             .broadcast(&Message::Disconnect { player: self.id });
-        self.game
-            .lock()
-            .get_player_mut(self.id)
+
+        let mut game = self.game.lock();
+
+        game.get_player_mut(self.id)
             .unwrap()
             .receiver
             .replace(Mutex::new(self.receiver.take().unwrap()));
+        let id = game.name().to_owned();
+        let game_empty = !game.players().values().any(PlayingPlayer::connected);
+        drop(game);
+
+        if game_empty {
+            let games = self.games.take().unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60 * 5)).await;
+                let games = games.upgrade()?;
+                {
+                    let mut games = games.lock().unwrap();
+
+                    if !games
+                        .get(&id)?
+                        .lock()
+                        .players()
+                        .values()
+                        .any(PlayingPlayer::connected)
+                    {
+                        games.remove(&id);
+                    }
+                }
+
+                Some(())
+            });
+        }
     }
 }
 
@@ -244,6 +276,7 @@ fn game_won(
 #[must_use]
 fn events<'a>(
     game: Option<Protected<Game<Player>>>,
+    state: &'a State<GlobalState>,
     jar: &'a CookieJar<'_>,
     mut end: Shutdown,
 ) -> EventStream![Event + 'a] {
@@ -299,6 +332,7 @@ fn events<'a>(
             game,
             id,
             receiver: Some(receiver),
+            games: Some(Arc::downgrade(&state.games)),
         };
 
         let receiver = guard.receiver.as_mut().unwrap();

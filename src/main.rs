@@ -14,7 +14,6 @@ mod lobby;
 
 use common::GlobalState;
 
-// TODO: delete game if everyone disconnects (after 1 min to let people time to reconnect)
 // TODO: use async mutex
 
 #[get("/")]
