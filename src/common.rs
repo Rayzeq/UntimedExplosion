@@ -1,6 +1,6 @@
-pub use crate::PlayerWrapper;
 use crate::{
-    game::{Game, Lobby, Player, Room},
+    game,
+    gameplay::{Game, Lobby, Player, Room},
     lobby,
 };
 use std::{
@@ -20,7 +20,7 @@ pub(crate) use make_event;
 
 pub struct GlobalState {
     pub lobbys: Mutex<HashMap<String, Protected<lobby::Player, Lobby<lobby::Player>>>>,
-    pub games: Mutex<HashMap<String, Protected<crate::PlayerWrapper, Game<crate::PlayerWrapper>>>>,
+    pub games: Mutex<HashMap<String, Protected<game::Player, Game<game::Player>>>>,
 }
 
 impl GlobalState {

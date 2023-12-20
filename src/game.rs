@@ -1,333 +1,381 @@
-use rand::{
-    seq::{IteratorRandom, SliceRandom},
-    thread_rng,
+use crate::{
+    common::{make_event, GlobalState, Protected},
+    gameplay::{self, errors, Cable, CutOutcome, Game, PlayingPlayer, Room, Team, WaitingPlayer},
 };
-use rocket::serde::{Deserialize, Serialize};
-use std::{collections::HashMap, hash::Hash};
+use rand::{seq::SliceRandom, thread_rng};
+use rocket::{
+    get,
+    http::{CookieJar, Status},
+    request::{FromRequest, Outcome, Request},
+    response::{
+        status::BadRequest,
+        stream::{Event, EventStream},
+    },
+    routes,
+    serde::Serialize,
+    tokio::{
+        select,
+        sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    },
+    Shutdown, State,
+};
+use std::{sync::Mutex, time::Duration};
 
-macro_rules! repeated_vec {
-    ($($quantity:expr => $value:expr),*) => {{
-        let mut v = Vec::with_capacity(repeated_vec!(@sum $($quantity),*));
-        $(
-            v.extend(std::iter::repeat($value).take($quantity));
-        )*
-        v
-    }};
-    (@sum $quantity:expr) => {
-        $quantity
-    };
-    (@sum $quantity:expr, $($quantities:expr),*) => {
-        $quantity + repeated_vec!(@sum $($quantities),*)
-    };
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(crate = "rocket::serde")]
-#[serde(rename_all = "lowercase")]
-pub enum Team {
-    Sherlock,
-    Moriarty,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(crate = "rocket::serde")]
-#[serde(rename_all = "lowercase")]
-pub enum Cable {
-    Safe,
-    Defusing,
-    Bomb,
-}
-
-pub trait Player {
-    type ID: Eq + Hash + Clone + Copy;
-
-    fn id(&self) -> Self::ID;
-}
-
-pub trait Room<PLAYER: Player> {
-    fn name(&self) -> &str;
-    fn players(&self) -> &HashMap<PLAYER::ID, PLAYER>;
-    fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER>;
-    fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER>;
-}
-
-pub trait WaitingPlayer: Player {
-    fn ready(&self) -> bool;
-}
-
-pub struct Lobby<PLAYER: WaitingPlayer> {
+#[derive(Debug)]
+pub struct Player {
+    id: <Self as gameplay::Player>::ID,
     name: String,
-    players: HashMap<PLAYER::ID, PLAYER>,
+    team: Team,
+    cables: Vec<Cable>,
+    revealed_cables: Vec<Cable>,
+    sender: UnboundedSender<Message>,
+    receiver: Option<Mutex<UnboundedReceiver<Message>>>,
 }
 
-impl<PLAYER: WaitingPlayer> Lobby<PLAYER> {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            players: HashMap::new(),
+#[derive(Debug, Clone, Serialize)]
+#[serde(crate = "rocket::serde")]
+struct PlayerData {
+    id: <Player as gameplay::Player>::ID,
+    name: String,
+    revealed_cables: Vec<Cable>,
+    connected: bool,
+}
+
+impl Player {
+    fn clone_data(&self) -> PlayerData {
+        PlayerData {
+            id: self.id,
+            name: self.name.clone(),
+            revealed_cables: self.revealed_cables.clone(),
+            connected: self.receiver.is_none(),
         }
-    }
-
-    pub fn add_player(&mut self, player: PLAYER) -> Result<(), errors::Join> {
-        if self.players.len() >= 8 {
-            return Err(errors::Join::GameFull);
-        }
-
-        if self.players.contains_key(&player.id()) {
-            return Err(errors::Join::AlreadyConnected);
-        }
-        self.players.insert(player.id(), player);
-
-        Ok(())
-    }
-
-    pub fn remove_player(&mut self, id: PLAYER::ID) {
-        self.players.remove(&id);
     }
 }
 
-impl<PLAYER: WaitingPlayer> Room<PLAYER> for Lobby<PLAYER> {
+impl gameplay::Player for Player {
+    type ID = u32;
+
+    fn id(&self) -> Self::ID {
+        self.id
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
+}
 
-    fn players(&self) -> &HashMap<PLAYER::ID, PLAYER> {
-        &self.players
+impl gameplay::PlayingPlayer for Player {
+    fn new<T: WaitingPlayer<ID = Self::ID>>(player: &T, team: Team) -> Self {
+        let (sender, receiver) = unbounded_channel();
+        Self {
+            id: player.id(),
+            name: player.name().to_owned(),
+            team,
+            cables: Vec::new(),
+            revealed_cables: Vec::new(),
+            sender,
+            receiver: Some(Mutex::new(receiver)),
+        }
     }
 
-    fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER> {
-        self.players.get(&id)
+    fn connected(&self) -> bool {
+        self.receiver.is_none()
     }
 
-    fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER> {
-        self.players.get_mut(&id)
+    fn team(&self) -> Team {
+        self.team
+    }
+
+    fn cables(&self) -> &[Cable] {
+        &self.cables
+    }
+
+    fn set_cables(&mut self, cables: Vec<Cable>) {
+        self.cables = cables;
+    }
+
+    fn cut_cable(&mut self) -> Cable {
+        self.cables.shuffle(&mut thread_rng());
+        let cutted = self.cables.pop().unwrap();
+        self.revealed_cables.push(cutted);
+        cutted
     }
 }
 
-pub mod errors {
-    use thiserror::Error;
-
-    #[derive(Error, Debug, Clone, Copy)]
-    pub enum Join {
-        #[error("this game is already full")]
-        GameFull,
-        #[error("you are already connected to this game")]
-        AlreadyConnected,
-    }
-}
-
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-//
-
-pub trait OldPlayer: WaitingPlayer {
-    fn connected(&self) -> bool;
-
-    fn team(&self) -> Team;
-    fn set_team(&mut self, team: Team);
-
-    fn set_cables(&mut self, cables: Vec<Cable>);
-    fn cut_cable(&mut self) -> Cable;
-    fn cables(&self) -> &[Cable];
-}
-
-pub enum CutOutcome {
-    Win(Team),
-    RoundEnd,
-    Nothing,
-}
-
-enum GameState<PLAYER: OldPlayer> {
-    Lobby,
-    Ingame {
-        wire_cutters: PLAYER::ID,
-        defusing_remaining: usize,
-        cutted_count: usize,
+#[derive(Debug, Clone, Serialize)]
+#[serde(crate = "rocket::serde")]
+#[serde(untagged)]
+enum Message {
+    Error {
+        reason: &'static str,
+    },
+    Initialize {
+        lobby: String,
+        players: Vec<PlayerData>,
+        team: Team,
+        wire_cutters: <Player as gameplay::Player>::ID,
+    },
+    Connect {
+        player: <Player as gameplay::Player>::ID,
+    },
+    Disconnect {
+        player: <Player as gameplay::Player>::ID,
+    },
+    RoundStart {
+        cables: Vec<Cable>,
+    },
+    Cut {
+        player: <Player as gameplay::Player>::ID,
+        cable: Cable,
+    },
+    Win {
+        team: Team,
+        players: Vec<<Player as gameplay::Player>::ID>,
     },
 }
 
-pub struct Game<PLAYER: OldPlayer> {
-    name: String,
-    players: HashMap<PLAYER::ID, PLAYER>,
-    state: GameState<PLAYER>,
-}
-
-impl<PLAYER: Player + OldPlayer> Room<PLAYER> for Game<PLAYER> {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn players(&self) -> &HashMap<PLAYER::ID, PLAYER> {
-        &self.players
-    }
-
-    fn get_player(&self, id: PLAYER::ID) -> Option<&PLAYER> {
-        self.players.get(&id)
-    }
-
-    fn get_player_mut(&mut self, id: PLAYER::ID) -> Option<&mut PLAYER> {
-        self.players.get_mut(&id)
+impl Message {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Error { .. } => "error",
+            Self::Initialize { .. } => "init",
+            Self::Connect { .. } => "connect",
+            Self::Disconnect { .. } => "disconnect",
+            Self::RoundStart { .. } => "round_start",
+            Self::Cut { .. } => "cut",
+            Self::Win { .. } => "win",
+        }
     }
 }
 
-impl<PLAYER: OldPlayer> Game<PLAYER> {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            players: HashMap::new(),
-            state: GameState::Lobby,
+impl Protected<Player, Game<Player>> {
+    #[allow(clippy::significant_drop_in_scrutinee)]
+    fn broadcast(&self, msg: &Message) {
+        for player in self.lock().players().values() {
+            player.sender.send(msg.clone()).unwrap();
         }
     }
+}
 
-    pub const fn wire_cutters(&self) -> Option<PLAYER::ID> {
-        if let GameState::Ingame { wire_cutters, .. } = self.state {
-            Some(wire_cutters)
-        } else {
-            None
-        }
-    }
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Protected<Player, Game<Player>> {
+    type Error = ();
 
-    pub fn remove_player(&mut self, id: PLAYER::ID) {
-        self.players.remove(&id);
-    }
-
-    pub const fn started(&self) -> bool {
-        matches!(self.state, GameState::Ingame { .. })
-    }
-
-    const fn cable_counts(player_count: usize) -> (usize, usize, usize) {
-        let defusing = player_count;
-        let bomb = 1;
-        let safe = player_count * 5 - defusing - bomb;
-
-        (safe, defusing, bomb)
-    }
-
-    fn distribute_cables(&mut self, mut cables: Vec<Cable>) {
-        cables.shuffle(&mut thread_rng());
-
-        let cables_per_player = cables.len() / self.players.len();
-        for player in self.players.values_mut() {
-            player.set_cables(cables.split_off(cables.len() - cables_per_player));
-        }
-    }
-
-    pub fn start(&mut self) -> Result<(), old_errors::GameStart> {
-        if self.players.len() < 4 {
-            return Err(old_errors::GameStart::NotEnoughPlayers);
-        }
-        if !self.players.values().all(WaitingPlayer::ready) {
-            return Err(old_errors::GameStart::NotAllPlayersReady);
-        }
-
-        let mut teams = match self.players.len() {
-            4..=5 => repeated_vec![3 => Team::Sherlock, 2 => Team::Moriarty],
-            6 => repeated_vec![4 => Team::Sherlock, 2 => Team::Moriarty],
-            7..=8 => repeated_vec![5 => Team::Sherlock, 3 => Team::Moriarty],
-            _ => unreachable!(),
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let Some(lobby) = request.cookies().get_private("lobby") else {
+            return Outcome::Error((Status::NotFound, ()));
         };
-        teams.shuffle(&mut thread_rng());
+        let games = request
+            .guard::<&State<GlobalState>>()
+            .await
+            .unwrap()
+            .games
+            .lock()
+            .unwrap();
 
-        for player in self.players.values_mut() {
-            player.set_team(teams.pop().unwrap());
-        }
+        games
+            .get(lobby.value())
+            .map(Self::clone)
+            .map_or_else(|| Outcome::Error((Status::NotFound, ())), Outcome::Success)
+    }
+}
 
-        let (safe_cables, defusing_cables, bomb) = Self::cable_counts(self.players.len());
-        let cables = repeated_vec![safe_cables => Cable::Safe, defusing_cables => Cable::Defusing, bomb => Cable::Bomb];
+struct ConnectionGuard {
+    game: Protected<Player, Game<Player>>,
+    id: <Player as gameplay::Player>::ID,
+    // we need the Option here because the destructor takes self by reference
+    // which mean we need Option::take to save the receiver from being destroyed
+    receiver: Option<UnboundedReceiver<Message>>,
+}
 
-        self.distribute_cables(cables);
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.game
+            .broadcast(&Message::Disconnect { player: self.id });
+        self.game
+            .lock()
+            .get_player_mut(self.id)
+            .unwrap()
+            .receiver
+            .replace(Mutex::new(self.receiver.take().unwrap()));
+    }
+}
 
-        self.state = GameState::Ingame {
-            wire_cutters: *self.players.keys().choose(&mut thread_rng()).unwrap(),
-            defusing_remaining: defusing_cables,
-            cutted_count: 0,
+fn send_round(game: &Protected<Player, Game<Player>>) {
+    #[allow(clippy::significant_drop_in_scrutinee)]
+    for player in game.lock().players().values() {
+        player
+            .sender
+            .send(Message::RoundStart {
+                cables: player.cables().to_owned(),
+            })
+            .unwrap();
+    }
+}
+
+fn game_won(
+    state: &State<GlobalState>,
+    game: &Protected<Player, Game<Player>>,
+    team: Team,
+    jar: &CookieJar<'_>,
+) {
+    let winning_players = game
+        .lock()
+        .players()
+        .values()
+        .filter(|p| p.team() == team)
+        .map(gameplay::Player::id)
+        .collect();
+    game.broadcast(&Message::Win {
+        team,
+        players: winning_players,
+    });
+
+    let lobby = &game.lock().name().to_owned();
+    state.games.lock().unwrap().remove(lobby);
+
+    jar.remove_private("lobby");
+    jar.remove_private("id");
+    jar.remove_private("name");
+}
+
+// WARNING: EventStream is broken with rust 1.74.X, stay on 1.73.X until this is fixed
+#[get("/game/events")]
+#[must_use]
+fn events<'a>(
+    game: Option<Protected<Player, Game<Player>>>,
+    jar: &'a CookieJar<'_>,
+    mut end: Shutdown,
+) -> EventStream![Event + 'a] {
+    EventStream! {
+        let Some(game) = game else {
+            yield make_event!(Message::Error {
+                reason: "You are not in a game"
+            });
+            return;
         };
 
-        Ok(())
-    }
+        let Some(Ok(id)) = jar.get_private("id").map(|x| x.value().parse::<<Player as gameplay::Player>::ID>()) else {
+            yield make_event!(Message::Error {
+                reason: "Invalid player id"
+            });
+            return;
+        };
 
-    pub fn cut(
-        &mut self,
-        cutting: PLAYER::ID,
-        cutted: PLAYER::ID,
-    ) -> Result<(Cable, CutOutcome), old_errors::Cut> {
-        if let GameState::Ingame {
-            wire_cutters,
-            defusing_remaining,
-            cutted_count,
-        } = &mut self.state
-        {
-            if cutting != *wire_cutters {
-                return Err(old_errors::Cut::DontHaveWireCutter);
-            }
-            if cutted == cutting {
-                return Err(old_errors::Cut::CannotSelfCut);
-            }
+        if game.lock().get_player(id).is_none() {
+            yield make_event!(Message::Error {
+                    reason: "You are not part of this game",
+                });
+            return;
+        };
 
-            let cable = self.players.get_mut(&cutted).unwrap().cut_cable();
-            *wire_cutters = cutted;
-            match cable {
-                Cable::Safe => *cutted_count += 1,
-                Cable::Defusing => {
-                    *defusing_remaining -= 1;
-                    *cutted_count += 1;
-                }
-                Cable::Bomb => return Ok((cable, CutOutcome::Win(Team::Moriarty))),
-            }
-            if *defusing_remaining == 0 {
-                return Ok((cable, CutOutcome::Win(Team::Sherlock)));
-            }
+        let Some(receiver) = game.lock().get_player_mut(id).unwrap().receiver.take() else {
+            yield make_event!(Message::Error {
+                    reason: "You are already connected to this game",
+                });
+            return;
+        };
+        let mut receiver = receiver.into_inner().unwrap();
+        // discard all previous messages
+        while receiver.try_recv().is_ok() {}
 
-            if *cutted_count == self.players.len() {
-                Ok((cable, CutOutcome::RoundEnd))
+        let msg = {
+            let game = game.lock();
+            let lobby_name = game.name().to_owned();
+            let player_list = game.players().values().map(Player::clone_data).collect();
+            let team = game.get_player(id).unwrap().team();
+            let wire_cutters = game.wire_cutters;
+            drop(game);
+            Message::Initialize { lobby: lobby_name, players: player_list, team, wire_cutters }
+        };
+        yield make_event!(msg);
+        yield make_event!(&Message::RoundStart {
+            cables: game.lock().get_player(id).unwrap().cables().to_owned()
+        });
+
+        game.broadcast(&Message::Connect { player: id });
+
+        let mut guard = ConnectionGuard {
+            game,
+            id,
+            receiver: Some(receiver),
+        };
+
+        let receiver = guard.receiver.as_mut().unwrap();
+
+        loop {
+            let Some(msg) = select! {
+                msg = receiver.recv() => msg,
+                () = &mut end => {
+                    yield make_event!(Message::Error {
+                        reason: "Server closed",
+                    });
+                    break
+                },
+            } else { break; };
+
+            yield make_event!(msg.clone());
+
+            if matches!(msg, Message::Win { .. }) {
+                break;
+            }
+        }
+    }.heartbeat(Duration::from_secs(5))
+}
+
+#[get("/game/cut?<player>")]
+#[allow(clippy::needless_pass_by_value)]
+fn cut(
+    player: <Player as gameplay::Player>::ID,
+    game: Protected<Player, Game<Player>>,
+    state: &State<GlobalState>,
+    jar: &CookieJar<'_>,
+) -> Result<(), BadRequest<&'static str>> {
+    let Some(Ok(id)) = jar
+        .get_private("id")
+        .map(|x| x.value().parse::<<Player as gameplay::Player>::ID>())
+    else {
+        return Err(BadRequest("Invalid player id"));
+    };
+
+    if game.lock().get_player(id).is_none() {
+        return Err(BadRequest("You are not part of this game"));
+    };
+
+    if game.lock().get_player(player).is_none() {
+        return Err(BadRequest(
+            "The player you specified is not part of this game",
+        ));
+    };
+
+    let result = game.lock().cut(id, player);
+    let (cable, outcome) = match result {
+        Ok(x) => x,
+        Err(errors::Cut::DontHaveWireCutter) => {
+            return Err(BadRequest("You don't have the wire cutter"))
+        }
+        Err(errors::Cut::CannotSelfCut) => {
+            return Err(BadRequest("You can't cut one of your own cables"))
+        }
+    };
+
+    game.broadcast(&Message::Cut { player, cable });
+
+    match outcome {
+        CutOutcome::Nothing => (),
+        CutOutcome::Win(team) => game_won(state, &game, team, jar),
+        CutOutcome::RoundEnd => {
+            if game.lock().next_round() {
+                game_won(state, &game, Team::Moriarty, jar);
             } else {
-                Ok((cable, CutOutcome::Nothing))
+                send_round(&game);
             }
-        } else {
-            Err(old_errors::Cut::GameNotStarted)
         }
     }
 
-    pub fn next_round(&mut self) -> bool {
-        if let GameState::Ingame { cutted_count, .. } = &mut self.state {
-            *cutted_count = 0;
-
-            let cables: Vec<Cable> = self
-                .players
-                .values_mut()
-                .flat_map(|p| p.cables().to_owned())
-                .collect();
-
-            if cables.len() == self.players.len() {
-                return true;
-            }
-
-            self.distribute_cables(cables);
-        }
-
-        false
-    }
+    Ok(())
 }
 
-pub mod old_errors {
-    pub enum GameStart {
-        NotEnoughPlayers,
-        NotAllPlayersReady,
-    }
-
-    pub enum Cut {
-        GameNotStarted,
-        DontHaveWireCutter,
-        CannotSelfCut,
-    }
+pub fn routes() -> Vec<rocket::Route> {
+    routes![events, cut]
 }
