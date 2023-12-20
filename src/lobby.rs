@@ -1,7 +1,7 @@
 use crate::{
     common::{make_event, GlobalState, Protected},
     game,
-    gameplay::{self, errors, Game, Lobby, Room},
+    gameplay::{self, errors, Game, Lobby, PlayingPlayer, Room},
 };
 use rand::{
     distributions::{Alphanumeric, DistString},
@@ -367,6 +367,28 @@ fn start(state: &State<GlobalState>, jar: &CookieJar<'_>) -> Status {
     for player in lobby.lock().players().values() {
         player.sender.send(Message::Start).unwrap();
     }
+
+    let games_ref = Arc::downgrade(&state.games);
+    let id = lobby.lock().name().to_owned();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let games = games_ref.upgrade()?;
+        {
+            let mut games = games.lock().unwrap();
+
+            if !games
+                .get(&id)?
+                .lock()
+                .players()
+                .values()
+                .any(PlayingPlayer::connected)
+            {
+                games.remove(&id);
+            }
+        }
+
+        Some(())
+    });
 
     Status::Ok
 }

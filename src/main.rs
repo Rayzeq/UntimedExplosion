@@ -14,8 +14,8 @@ mod lobby;
 
 use common::GlobalState;
 
-// TODO: auto-delete created game if nobody joins
 // TODO: delete game if everyone disconnects (after 1 min to let people time to reconnect)
+// TODO: use async mutex
 
 #[get("/")]
 fn index() -> Redirect {
