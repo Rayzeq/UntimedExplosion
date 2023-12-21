@@ -14,8 +14,6 @@ mod lobby;
 
 use common::GlobalState;
 
-// TODO: use async mutex
-
 #[get("/")]
 fn index() -> Redirect {
     Redirect::to("/gameMenu.html")

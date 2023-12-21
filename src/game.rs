@@ -15,13 +15,16 @@ use rocket::{
     serde::Serialize,
     tokio::{
         self, select,
-        sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        sync::{
+            mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+            Mutex,
+        },
     },
     Shutdown, State,
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -154,8 +157,15 @@ impl Message {
 
 impl Protected<Game<Player>> {
     #[allow(clippy::significant_drop_in_scrutinee)]
-    fn broadcast(&self, msg: &Message) {
-        for player in self.lock().players().values() {
+    async fn broadcast(&self, msg: &Message) {
+        for player in self.lock().await.players().values() {
+            player.sender.send(msg.clone()).unwrap();
+        }
+    }
+
+    #[allow(clippy::significant_drop_in_scrutinee)]
+    fn blocking_broadcast(&self, msg: &Message) {
+        for player in self.blocking_lock().players().values() {
             player.sender.send(msg.clone()).unwrap();
         }
     }
@@ -175,7 +185,7 @@ impl<'r> FromRequest<'r> for Protected<Game<Player>> {
             .unwrap()
             .games
             .lock()
-            .unwrap();
+            .await;
 
         games
             .get(lobby.value())
@@ -184,21 +194,23 @@ impl<'r> FromRequest<'r> for Protected<Game<Player>> {
     }
 }
 
+type Games = Mutex<HashMap<String, Protected<Game<Player>>>>;
+
 struct ConnectionGuard {
     game: Protected<Game<Player>>,
     id: <Player as gameplay::Player>::ID,
     // we need the Option here because the destructor takes self by reference
     // which mean we need Option::take to save the receiver from being destroyed
     receiver: Option<UnboundedReceiver<Message>>,
-    games: Option<Weak<Mutex<HashMap<String, Protected<Game<Player>>>>>>,
+    games: Option<Weak<Games>>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.game
-            .broadcast(&Message::Disconnect { player: self.id });
+            .blocking_broadcast(&Message::Disconnect { player: self.id });
 
-        let mut game = self.game.lock();
+        let mut game = self.game.blocking_lock();
 
         game.get_player_mut(self.id)
             .unwrap()
@@ -214,11 +226,12 @@ impl Drop for ConnectionGuard {
                 tokio::time::sleep(Duration::from_secs(60 * 5)).await;
                 let games = games.upgrade()?;
                 {
-                    let mut games = games.lock().unwrap();
+                    let mut games = games.lock().await;
 
                     if !games
                         .get(&id)?
                         .lock()
+                        .await
                         .players()
                         .values()
                         .any(PlayingPlayer::connected)
@@ -233,9 +246,9 @@ impl Drop for ConnectionGuard {
     }
 }
 
-fn send_round(game: &Protected<Game<Player>>) {
+async fn send_round(game: &Protected<Game<Player>>) {
     #[allow(clippy::significant_drop_in_scrutinee)]
-    for player in game.lock().players().values() {
+    for player in game.lock().await.players().values() {
         player
             .sender
             .send(Message::RoundStart {
@@ -245,7 +258,7 @@ fn send_round(game: &Protected<Game<Player>>) {
     }
 }
 
-fn game_won(
+async fn game_won(
     state: &State<GlobalState>,
     game: &Protected<Game<Player>>,
     team: Team,
@@ -253,6 +266,7 @@ fn game_won(
 ) {
     let winning_players = game
         .lock()
+        .await
         .players()
         .values()
         .filter(|p| p.team() == team)
@@ -261,10 +275,11 @@ fn game_won(
     game.broadcast(&Message::Win {
         team,
         players: winning_players,
-    });
+    })
+    .await;
 
-    let lobby = &game.lock().name().to_owned();
-    state.games.lock().unwrap().remove(lobby);
+    let lobby = &game.lock().await.name().to_owned();
+    state.games.lock().await.remove(lobby);
 
     jar.remove_private("lobby");
     jar.remove_private("id");
@@ -295,25 +310,25 @@ fn events<'a>(
             return;
         };
 
-        if game.lock().get_player(id).is_none() {
+        if game.lock().await.get_player(id).is_none() {
             yield make_event!(Message::Error {
                     reason: "You are not part of this game",
                 });
             return;
         };
 
-        let Some(receiver) = game.lock().get_player_mut(id).unwrap().receiver.take() else {
+        let Some(receiver) = game.lock().await.get_player_mut(id).unwrap().receiver.take() else {
             yield make_event!(Message::Error {
                     reason: "You are already connected to this game",
                 });
             return;
         };
-        let mut receiver = receiver.into_inner().unwrap();
+        let mut receiver = receiver.into_inner();
         // discard all previous messages
         while receiver.try_recv().is_ok() {}
 
         let msg = {
-            let game = game.lock();
+            let game = game.lock().await;
             let lobby_name = game.name().to_owned();
             let player_list = game.players().values().map(Player::clone_data).collect();
             let team = game.get_player(id).unwrap().team();
@@ -323,10 +338,10 @@ fn events<'a>(
         };
         yield make_event!(msg);
         yield make_event!(&Message::RoundStart {
-            cables: game.lock().get_player(id).unwrap().cables().to_owned()
+            cables: game.lock().await.get_player(id).unwrap().cables().to_owned()
         });
 
-        game.broadcast(&Message::Connect { player: id });
+        game.broadcast(&Message::Connect { player: id }).await;
 
         let mut guard = ConnectionGuard {
             game,
@@ -359,7 +374,7 @@ fn events<'a>(
 
 #[get("/game/cut?<player>")]
 #[allow(clippy::needless_pass_by_value)]
-fn cut(
+async fn cut(
     player: <Player as gameplay::Player>::ID,
     game: Protected<Game<Player>>,
     state: &State<GlobalState>,
@@ -372,17 +387,17 @@ fn cut(
         return Err(BadRequest("Invalid player id"));
     };
 
-    if game.lock().get_player(id).is_none() {
+    if game.lock().await.get_player(id).is_none() {
         return Err(BadRequest("You are not part of this game"));
     };
 
-    if game.lock().get_player(player).is_none() {
+    if game.lock().await.get_player(player).is_none() {
         return Err(BadRequest(
             "The player you specified is not part of this game",
         ));
     };
 
-    let result = game.lock().cut(id, player);
+    let result = game.lock().await.cut(id, player);
     let (cable, outcome) = match result {
         Ok(x) => x,
         Err(errors::Cut::DontHaveWireCutter) => {
@@ -393,16 +408,16 @@ fn cut(
         }
     };
 
-    game.broadcast(&Message::Cut { player, cable });
+    game.broadcast(&Message::Cut { player, cable }).await;
 
     match outcome {
         CutOutcome::Nothing => (),
-        CutOutcome::Win(team) => game_won(state, &game, team, jar),
+        CutOutcome::Win(team) => game_won(state, &game, team, jar).await,
         CutOutcome::RoundEnd => {
-            if game.lock().next_round() {
-                game_won(state, &game, Team::Moriarty, jar);
+            if game.lock().await.next_round() {
+                game_won(state, &game, Team::Moriarty, jar).await;
             } else {
-                send_round(&game);
+                send_round(&game).await;
             }
         }
     }

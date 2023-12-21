@@ -3,10 +3,8 @@ use crate::{
     gameplay::{Game, Lobby},
     lobby,
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use rocket::tokio::sync::{Mutex, MutexGuard};
+use std::{collections::HashMap, sync::Arc};
 
 macro_rules! make_event {
     ($message:expr) => {{
@@ -33,13 +31,17 @@ impl GlobalState {
 
 pub struct Protected<T>(Arc<Mutex<T>>);
 
-impl<T> Protected<T> {
+impl<T: Send> Protected<T> {
     pub fn new(content: T) -> Self {
         Self(Arc::new(Mutex::new(content)))
     }
 
-    pub fn lock(&self) -> MutexGuard<T> {
-        self.0.lock().unwrap()
+    pub async fn lock(&self) -> MutexGuard<T> {
+        self.0.lock().await
+    }
+
+    pub fn blocking_lock(&self) -> MutexGuard<T> {
+        self.0.blocking_lock()
     }
 }
 
