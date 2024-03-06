@@ -271,7 +271,7 @@ fn events<'a>(
         let guard = ConnectionGuard { lobbys: &state.lobbys, lobby, id };
 
         loop {
-            let Some(msg) = select! {
+            let Some(msg) = (select! {
                 msg = receiver.recv() => msg,
                 () = &mut end => {
                     yield make_event!(Message::Error {
@@ -279,7 +279,7 @@ fn events<'a>(
                     });
                     return;
                 },
-            } else { break; };
+            }) else { break; };
             if matches!(msg, Message::SelfLeave) {
                 break;
             }

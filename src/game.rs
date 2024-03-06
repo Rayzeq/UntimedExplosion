@@ -338,7 +338,7 @@ fn events<'a>(
         let receiver = guard.receiver.as_mut().unwrap();
 
         loop {
-            let Some(msg) = select! {
+            let Some(msg) = (select! {
                 msg = receiver.recv() => msg,
                 () = &mut end => {
                     yield make_event!(Message::Error {
@@ -346,7 +346,7 @@ fn events<'a>(
                     });
                     break
                 },
-            } else { break; };
+            }) else { break; };
 
             yield make_event!(msg.clone());
 
